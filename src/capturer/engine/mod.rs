@@ -42,11 +42,7 @@ pub struct Engine {
     options: Options,
 
     #[cfg(target_os = "macos")]
-    mac: (
-        cidre::arc::R<mac::Capturer>,
-        cidre::arc::R<mac::ErrorHandler>,
-        cidre::arc::R<cidre::sc::Stream>,
-    ),
+    mac: mac::CaptureSession,
     #[cfg(target_os = "macos")]
     error_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 

@@ -1,4 +1,4 @@
-use cidre::{cg, ns, sc};
+use cidre::{cg, sc};
 use cocoa::appkit::{NSApp, NSScreen};
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSRect, NSString, NSUInteger};

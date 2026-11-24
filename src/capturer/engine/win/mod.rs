@@ -8,7 +8,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     StreamInstant,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 use std::{cmp, time::Duration};
 use std::{
     os::windows,
@@ -33,6 +33,7 @@ struct Capturer {
     pub crop: Option<Area>,
     pub start_time: (i64, SystemTime),
     pub perf_freq: i64,
+    pixel_buffer: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -54,18 +55,19 @@ impl GraphicsCaptureApiHandler for Capturer {
     fn new(context: Context<Self::Flags>) -> Result<Self, Self::Error> {
         Ok(Self {
             tx: context.flags.tx,
+            pixel_buffer: Vec::new(),
             crop: context.flags.crop,
             start_time: (
                 unsafe {
                     let mut time = 0;
-                    QueryPerformanceCounter(&mut time);
+                    QueryPerformanceCounter(&mut time)?;
                     time
                 },
                 SystemTime::now(),
             ),
             perf_freq: unsafe {
                 let mut freq = 0;
-                QueryPerformanceFrequency(&mut freq);
+                QueryPerformanceFrequency(&mut freq)?;
                 freq
             },
         })
@@ -76,7 +78,7 @@ impl GraphicsCaptureApiHandler for Capturer {
         frame: &mut WCFrame,
         _: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        let elapsed = frame.timestamp().Duration - self.start_time.0;
+        let elapsed = frame.timestamp()?.Duration - self.start_time.0;
         let display_time = self
             .start_time
             .1
@@ -85,58 +87,22 @@ impl GraphicsCaptureApiHandler for Capturer {
             ))
             .unwrap();
 
-        match &self.crop {
-            Some(cropped_area) => {
-                // get the cropped area
-                let start_x = cropped_area.origin.x as u32;
-                let start_y = cropped_area.origin.y as u32;
-                let end_x = (cropped_area.origin.x + cropped_area.size.width) as u32;
-                let end_y = (cropped_area.origin.y + cropped_area.size.height) as u32;
-
-                // crop the frame
-                let mut cropped_buffer = frame
-                    .buffer_crop(start_x, start_y, end_x, end_y)
-                    .expect("Failed to crop buffer");
-
-                // get raw frame buffer
-                let raw_frame_buffer = match cropped_buffer.as_nopadding_buffer() {
-                    Ok(buffer) => buffer,
-                    Err(_) => return Err(("Failed to get raw buffer").into()),
-                };
-
-                let current_time = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Failed to get current time")
-                    .as_nanos() as u64;
-
-                let bgr_frame = BGRAFrame {
-                    display_time,
-                    width: cropped_area.size.width as i32,
-                    height: cropped_area.size.height as i32,
-                    data: raw_frame_buffer.to_vec(),
-                };
-
-                let _ = self.tx.send(Frame::Video(VideoFrame::BGRA(bgr_frame)));
-            }
-            None => {
-                // get raw frame buffer
-                let mut frame_buffer = frame.buffer().unwrap();
-                let raw_frame_buffer = frame_buffer.as_raw_buffer();
-                let frame_data = raw_frame_buffer.to_vec();
-                let current_time = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Failed to get current time")
-                    .as_nanos() as u64;
-                let bgr_frame = BGRAFrame {
-                    display_time,
-                    width: frame.width() as i32,
-                    height: frame.height() as i32,
-                    data: frame_data,
-                };
-
-                let _ = self.tx.send(Frame::Video(VideoFrame::BGRA(bgr_frame)));
-            }
-        }
+        let buffer = match &self.crop {
+            Some(area) => frame.buffer_crop(
+                area.origin.x as u32,
+                area.origin.y as u32,
+                (area.origin.x + area.size.width) as u32,
+                (area.origin.y + area.size.height) as u32,
+            )?,
+            None => frame.buffer()?,
+        };
+        let frame = BGRAFrame {
+            display_time,
+            width: buffer.width() as i32,
+            height: buffer.height() as i32,
+            data: buffer.as_nopadding_buffer(&mut self.pixel_buffer).to_vec(),
+        };
+        let _ = self.tx.send(Frame::Video(VideoFrame::BGRA(frame)));
         Ok(())
     }
 
