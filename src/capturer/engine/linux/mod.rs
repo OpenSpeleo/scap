@@ -5,7 +5,7 @@ use std::{
         mpsc::{self, sync_channel, SyncSender},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use pipewire as pw;
@@ -31,7 +31,7 @@ use pw::{
 
 use crate::{
     capturer::Options,
-    frame::{BGRxFrame, Frame, RGBFrame, RGBxFrame, XBGRFrame},
+    frame::{BGRxFrame, Frame, RGBFrame, RGBxFrame, VideoFrame, XBGRFrame},
 };
 
 use self::{error::LinCapError, portal::ScreenCastPortal};
@@ -44,6 +44,7 @@ static STREAM_STATE_CHANGED_TO_ERROR: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct ListenerUserData {
+    time_origin: Option<(i64, SystemTime)>,
     pub tx: mpsc::Sender<Frame>,
     pub format: spa::param::video::VideoInfoRaw,
 }
@@ -82,16 +83,13 @@ fn state_changed_callback(
     _old: StreamState,
     new: StreamState,
 ) {
-    match new {
-        StreamState::Error(e) => {
-            eprintln!("pipewire: State changed to error({e})");
-            STREAM_STATE_CHANGED_TO_ERROR.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        _ => {}
+    if let StreamState::Error(e) = new {
+        eprintln!("pipewire: State changed to error({e})");
+        STREAM_STATE_CHANGED_TO_ERROR.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-unsafe fn get_timestamp(buffer: *mut spa_buffer) -> i64 {
+unsafe fn get_timestamp(buffer: *mut spa_buffer) -> Option<i64> {
     let n_metas = (*buffer).n_metas;
     if n_metas > 0 {
         let mut meta_ptr = (*buffer).metas;
@@ -100,14 +98,65 @@ unsafe fn get_timestamp(buffer: *mut spa_buffer) -> i64 {
             if (*meta_ptr).type_ == SPA_META_Header {
                 let meta_header: &mut spa_meta_header =
                     &mut *((*meta_ptr).data as *mut spa_meta_header);
-                return meta_header.pts;
+                return (meta_header.pts != i64::MIN).then_some(meta_header.pts);
             }
             meta_ptr = meta_ptr.wrapping_add(1);
         }
-        0
-    } else {
-        0
     }
+    None
+}
+
+// Anchor stream-relative presentation times to the first timestamped buffer's arrival.
+fn presentation_time(
+    origin: &mut Option<(i64, SystemTime)>,
+    pts: Option<i64>,
+    now: SystemTime,
+) -> SystemTime {
+    let Some(pts) = pts else { return now };
+    let (first_pts, first_time) = *origin.get_or_insert((pts, now));
+    let delta = Duration::from_nanos(pts.abs_diff(first_pts));
+    if pts >= first_pts {
+        first_time.checked_add(delta)
+    } else {
+        first_time.checked_sub(delta)
+    }
+    .unwrap_or(now)
+}
+
+fn packed_frame(
+    format: VideoFormat,
+    display_time: SystemTime,
+    width: i32,
+    height: i32,
+    data: Vec<u8>,
+) -> Frame {
+    Frame::Video(match format {
+        VideoFormat::RGBx => VideoFrame::RGBx(RGBxFrame {
+            display_time,
+            width,
+            height,
+            data,
+        }),
+        VideoFormat::RGB => VideoFrame::RGB(RGBFrame {
+            display_time,
+            width,
+            height,
+            data,
+        }),
+        VideoFormat::xBGR => VideoFrame::XBGR(XBGRFrame {
+            display_time,
+            width,
+            height,
+            data,
+        }),
+        VideoFormat::BGRx => VideoFrame::BGRx(BGRxFrame {
+            display_time,
+            width,
+            height,
+            data,
+        }),
+        _ => panic!("Unsupported frame format received"),
+    })
 }
 
 fn process_callback(stream: &StreamRef, user_data: &mut ListenerUserData) {
@@ -118,7 +167,11 @@ fn process_callback(stream: &StreamRef, user_data: &mut ListenerUserData) {
             if buffer.is_null() {
                 break 'outside;
             }
-            let timestamp = unsafe { get_timestamp(buffer) };
+            let display_time = presentation_time(
+                &mut user_data.time_origin,
+                unsafe { get_timestamp(buffer) },
+                SystemTime::now(),
+            );
 
             let n_datas = unsafe { (*buffer).n_datas };
             if n_datas < 1 {
@@ -133,33 +186,14 @@ fn process_callback(stream: &StreamRef, user_data: &mut ListenerUserData) {
                 .to_vec()
             };
 
-            if let Err(e) = match user_data.format.format() {
-                VideoFormat::RGBx => user_data.tx.send(Frame::RGBx(RGBxFrame {
-                    display_time: timestamp as u64,
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                })),
-                VideoFormat::RGB => user_data.tx.send(Frame::RGB(RGBFrame {
-                    display_time: timestamp as u64,
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                })),
-                VideoFormat::xBGR => user_data.tx.send(Frame::XBGR(XBGRFrame {
-                    display_time: timestamp as u64,
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                })),
-                VideoFormat::BGRx => user_data.tx.send(Frame::BGRx(BGRxFrame {
-                    display_time: timestamp as u64,
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                })),
-                _ => panic!("Unsupported frame format received"),
-            } {
+            let frame = packed_frame(
+                user_data.format.format(),
+                display_time,
+                frame_size.width as i32,
+                frame_size.height as i32,
+                frame_data,
+            );
+            if let Err(e) = user_data.tx.send(frame) {
                 eprintln!("{e}");
             }
         }
@@ -185,6 +219,7 @@ fn pipewire_capturer(
 
     let user_data = ListenerUserData {
         tx,
+        time_origin: None,
         format: Default::default(),
     };
 
@@ -366,4 +401,48 @@ impl LinuxCapturer {
 
 pub fn create_capturer(options: &Options, tx: mpsc::Sender<Frame>) -> LinuxCapturer {
     LinuxCapturer::new(options, tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presentation_times_follow_stream_pts() {
+        let mut origin = None;
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        let later = start + Duration::from_secs(2);
+        assert_eq!(presentation_time(&mut origin, None, start), start);
+        assert_eq!(presentation_time(&mut origin, Some(100), later), later);
+        assert_eq!(
+            presentation_time(&mut origin, Some(120), later),
+            later + Duration::from_nanos(20)
+        );
+        assert_eq!(
+            presentation_time(&mut origin, Some(90), later),
+            later - Duration::from_nanos(10)
+        );
+    }
+
+    macro_rules! frame_test {
+        ($name:ident, $format:ident, $variant:ident, $bytes_per_pixel:literal) => {
+            #[test]
+            fn $name() {
+                let time = SystemTime::UNIX_EPOCH + Duration::from_nanos(123_456);
+                let data: Vec<u8> = (0..2 * 3 * $bytes_per_pixel).collect();
+                let frame = packed_frame(VideoFormat::$format, time, 2, 3, data.clone());
+                let Frame::Video(VideoFrame::$variant(frame)) = frame else {
+                    panic!("unexpected frame variant");
+                };
+                assert_eq!(frame.display_time, time);
+                assert_eq!((frame.width, frame.height), (2, 3));
+                assert_eq!(frame.data, data);
+            }
+        };
+    }
+
+    frame_test!(rgbx_frame, RGBx, RGBx, 4);
+    frame_test!(rgb_frame, RGB, RGB, 3);
+    frame_test!(xbgr_frame, xBGR, XBGR, 4);
+    frame_test!(bgrx_frame, BGRx, BGRx, 4);
 }

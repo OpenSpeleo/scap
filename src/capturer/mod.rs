@@ -25,6 +25,7 @@ pub enum Resolution {
     Captured,
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Resolution {
     fn value(&self, aspect_ratio: f32) -> [u32; 2] {
         match *self {
@@ -151,5 +152,7 @@ impl Capturer {
 }
 
 pub struct RawCapturer<'a> {
+    // Only macOS exposes native pixel buffers through this borrowed handle.
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
     capturer: &'a Capturer,
 }

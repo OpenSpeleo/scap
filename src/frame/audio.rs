@@ -11,6 +11,7 @@ pub struct AudioFrame {
 }
 
 impl AudioFrame {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) fn new(
         format: AudioFormat,
         channels: u16,
