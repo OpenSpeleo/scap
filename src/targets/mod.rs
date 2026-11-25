@@ -49,14 +49,8 @@ pub fn get_all_targets() -> Vec<Target> {
     return linux::get_all_targets();
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub fn get_scale_factor(target: &Target) -> f64 {
-    #[cfg(target_os = "macos")]
-    return mac::get_scale_factor(target);
-
-    #[cfg(target_os = "windows")]
-    return win::get_scale_factor(target);
-}
+#[cfg(target_os = "macos")]
+pub use mac::get_scale_factor;
 
 pub fn get_main_display() -> Display {
     #[cfg(target_os = "macos")]

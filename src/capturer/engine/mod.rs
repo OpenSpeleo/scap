@@ -70,11 +70,11 @@ impl Engine {
 
         #[cfg(target_os = "windows")]
         {
-            let win = win::create_capturer(&options, tx).unwrap();
-            return Engine {
+            let win = win::create_capturer(options, tx).unwrap();
+            Engine {
                 win,
-                options: (*options).clone(),
-            };
+                options: options.clone(),
+            }
         }
 
         #[cfg(target_os = "linux")]

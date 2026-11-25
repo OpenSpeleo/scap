@@ -10,8 +10,8 @@ use std::{
 
 use pipewire as pw;
 use pw::{
-    context::Context,
-    main_loop::MainLoop,
+    context::ContextRc,
+    main_loop::MainLoopRc,
     properties::properties,
     spa::{
         self,
@@ -26,7 +26,7 @@ use pw::{
         },
         utils::{Direction, SpaTypes},
     },
-    stream::{StreamRef, StreamState},
+    stream::{Stream, StreamState},
 };
 
 use crate::{
@@ -50,7 +50,7 @@ struct ListenerUserData {
 }
 
 fn param_changed_callback(
-    _stream: &StreamRef,
+    _stream: &Stream,
     user_data: &mut ListenerUserData,
     id: u32,
     param: Option<&Pod>,
@@ -78,7 +78,7 @@ fn param_changed_callback(
 }
 
 fn state_changed_callback(
-    _stream: &StreamRef,
+    _stream: &Stream,
     _user_data: &mut ListenerUserData,
     _old: StreamState,
     new: StreamState,
@@ -159,7 +159,7 @@ fn packed_frame(
     })
 }
 
-fn process_callback(stream: &StreamRef, user_data: &mut ListenerUserData) {
+fn process_callback(stream: &Stream, user_data: &mut ListenerUserData) {
     let buffer = unsafe { stream.dequeue_raw_buffer() };
     if !buffer.is_null() {
         'outside: {
@@ -213,9 +213,9 @@ fn pipewire_capturer(
 ) -> Result<(), LinCapError> {
     pw::init();
 
-    let mainloop = MainLoop::new(None)?;
-    let context = Context::new(&mainloop)?;
-    let core = context.connect(None)?;
+    let mainloop = MainLoopRc::new(None)?;
+    let context = ContextRc::new(&mainloop, None)?;
+    let core = context.connect_rc(None)?;
 
     let user_data = ListenerUserData {
         tx,
@@ -223,7 +223,7 @@ fn pipewire_capturer(
         format: Default::default(),
     };
 
-    let stream = pw::stream::Stream::new(
+    let stream = pw::stream::StreamBox::new(
         &core,
         "scap",
         properties! {

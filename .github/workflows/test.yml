@@ -1,6 +1,10 @@
 name: Test
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -20,7 +24,7 @@ jobs:
           - windows-latest
           - windows-11-vs2026-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

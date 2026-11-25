@@ -1,19 +1,14 @@
 use crate::{
     capturer::{Area, Options, Point, Resolution, Size},
     frame::{AudioFormat, AudioFrame, BGRAFrame, Frame, FrameType, VideoFrame},
-    targets::{self, get_scale_factor, Target},
+    targets::{self, Target},
 };
 use ::windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-    StreamInstant,
-};
-use std::time::SystemTime;
-use std::{cmp, time::Duration};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::{
-    os::windows,
-    ptr::null_mut,
+    cmp,
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    time::{Duration, SystemTime},
 };
 use windows_capture::{
     capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
@@ -142,10 +137,12 @@ struct FlagStruct {
     pub crop: Option<Area>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CreateCapturerError {
-    AudioStreamConfig(cpal::DefaultStreamConfigError),
-    BuildAudioStream(cpal::BuildStreamError),
+    #[error("failed to get audio stream configuration: {0}")]
+    AudioStreamConfig(#[source] cpal::DefaultStreamConfigError),
+    #[error("failed to build audio stream: {0}")]
+    BuildAudioStream(#[source] cpal::BuildStreamError),
 }
 
 pub fn create_capturer(
@@ -167,13 +164,12 @@ pub fn create_capturer(
         false => CursorCaptureSettings::WithoutCursor,
     };
 
-    let draw_border = if GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false) {
-        options
-            .show_highlight
-            .then_some(DrawBorderSettings::WithBorder)
-            .unwrap_or(DrawBorderSettings::WithoutBorder)
-    } else {
+    let draw_border = if !GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false) {
         DrawBorderSettings::Default
+    } else if options.show_highlight {
+        DrawBorderSettings::WithBorder
+    } else {
+        DrawBorderSettings::WithoutBorder
     };
 
     let settings = match target {
@@ -230,11 +226,6 @@ pub fn create_capturer(
 }
 
 pub fn get_output_frame_size(options: &Options) -> [u32; 2] {
-    let target = options
-        .target
-        .clone()
-        .unwrap_or_else(|| Target::Display(targets::get_main_display()));
-
     let crop_area = get_crop_area(options);
 
     let mut output_width = (crop_area.size.width) as u32;
@@ -258,43 +249,37 @@ pub fn get_output_frame_size(options: &Options) -> [u32; 2] {
     [output_width, output_height]
 }
 
-fn get_absolute_value(value: f64, scale_factor: f64) -> f64 {
-    let value = (value).floor();
+fn even_pixel(value: f64) -> f64 {
+    let value = value.floor();
     value + value % 2.0
 }
 
 pub fn get_crop_area(options: &Options) -> Area {
+    if let Some(area) = &options.crop_area {
+        return Area {
+            origin: Point {
+                x: even_pixel(area.origin.x),
+                y: even_pixel(area.origin.y),
+            },
+            size: Size {
+                width: even_pixel(area.size.width),
+                height: even_pixel(area.size.height),
+            },
+        };
+    }
+
     let target = options
         .target
         .clone()
         .unwrap_or_else(|| Target::Display(targets::get_main_display()));
-
     let (width, height) = targets::get_target_dimensions(&target);
-
-    let scale_factor = targets::get_scale_factor(&target);
-    options
-        .crop_area
-        .as_ref()
-        .map(|val| {
-            // WINDOWS: limit values [input-width, input-height] = [146, 50]
-            Area {
-                origin: Point {
-                    x: get_absolute_value(val.origin.x, scale_factor),
-                    y: get_absolute_value(val.origin.y, scale_factor),
-                },
-                size: Size {
-                    width: get_absolute_value(val.size.width, scale_factor),
-                    height: get_absolute_value(val.size.height, scale_factor),
-                },
-            }
-        })
-        .unwrap_or_else(|| Area {
-            origin: Point { x: 0.0, y: 0.0 },
-            size: Size {
-                width: width as f64,
-                height: height as f64,
-            },
-        })
+    Area {
+        origin: Point { x: 0.0, y: 0.0 },
+        size: Size {
+            width: width as f64,
+            height: height as f64,
+        },
+    }
 }
 
 struct AudioStreamHandle {
@@ -308,9 +293,7 @@ enum AudioStreamControl {
 }
 
 fn build_audio_stream(
-    sample_tx: mpsc::Sender<
-        Result<(Vec<u8>, cpal::InputCallbackInfo, SystemTime), cpal::StreamError>,
-    >,
+    sample_tx: Sender<Result<(Vec<u8>, SystemTime), cpal::StreamError>>,
 ) -> Result<(cpal::Stream, cpal::SupportedStreamConfig), CreateCapturerError> {
     let host = cpal::default_host();
     let output_device =
@@ -329,9 +312,9 @@ fn build_audio_stream(
             supported_config.sample_format(),
             {
                 let sample_tx = sample_tx.clone();
-                move |data, info: &cpal::InputCallbackInfo| {
+                move |data, _| {
                     sample_tx
-                        .send(Ok((data.bytes().to_vec(), info.clone(), SystemTime::now())))
+                        .send(Ok((data.bytes().to_vec(), SystemTime::now())))
                         .unwrap();
                 }
             },
@@ -388,7 +371,7 @@ fn spawn_audio_stream(
                 Err(_) => return,
             };
 
-            let (data, info, timestamp) = match sample_rx.recv_timeout(Duration::from_millis(100)) {
+            let (data, timestamp) = match sample_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(data)) => data,
                 Err(RecvTimeoutError::Timeout) => {
                     continue;
@@ -411,9 +394,55 @@ fn spawn_audio_stream(
                 timestamp,
             );
 
-            if let Err(_) = tx.send(Frame::Audio(frame)) {
+            if tx.send(Frame::Audio(frame)).is_err() {
                 return;
             };
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn audio_initialization_errors_preserve_the_cpal_cause() {
+        let error = CreateCapturerError::AudioStreamConfig(
+            cpal::DefaultStreamConfigError::DeviceNotAvailable,
+        );
+        assert!(matches!(
+            error.source().unwrap().downcast_ref(),
+            Some(cpal::DefaultStreamConfigError::DeviceNotAvailable)
+        ));
+
+        let error =
+            CreateCapturerError::BuildAudioStream(cpal::BuildStreamError::StreamConfigNotSupported);
+        assert!(matches!(
+            error.source().unwrap().downcast_ref(),
+            Some(cpal::BuildStreamError::StreamConfigNotSupported)
+        ));
+    }
+
+    #[test]
+    fn explicit_crop_uses_pixel_coordinates_without_querying_a_monitor() {
+        let options = Options {
+            target: Some(Target::Display(targets::Display {
+                id: 0,
+                title: String::new(),
+                raw_handle: Default::default(),
+            })),
+            crop_area: Some(Area {
+                origin: Point { x: 3.5, y: 6.5 },
+                size: Size {
+                    width: 101.5,
+                    height: 59.0,
+                },
+            }),
+            ..Default::default()
+        };
+        let crop = get_crop_area(&options);
+        assert_eq!((crop.origin.x, crop.origin.y), (4.0, 6.0));
+        assert_eq!(get_output_frame_size(&options), [102, 60]);
+    }
 }
